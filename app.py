@@ -43,13 +43,13 @@ st.markdown(
         background: rgba(255,255,255,0.05);
         border: 1px solid rgba(255,255,255,0.12);
         border-radius: 14px;
-        padding: 16px 18px;
+        padding: 10px 8px;
         text-align: center;
         box-shadow: 0 2px 8px rgba(0,0,0,0.25);
     }
-    [data-testid="stMetricLabel"] { justify-content: center; font-size: 1rem; opacity: 0.8; }
-    [data-testid="stMetricLabel"] p { font-size: 1rem; }
-    [data-testid="stMetricValue"] { justify-content: center; font-size: 2rem; font-weight: 700; }
+    [data-testid="stMetricLabel"] { justify-content: center; font-size: 0.85rem; opacity: 0.8; }
+    [data-testid="stMetricLabel"] p { font-size: 0.85rem; }
+    [data-testid="stMetricValue"] { justify-content: center; font-size: 1.5rem; font-weight: 700; }
     [data-testid="stAlert"] {
         border-radius: 14px;
         font-size: 1.3rem;
@@ -110,12 +110,13 @@ def show_score(score_box, chart_box, history):
     s = np.array(history) if history else np.zeros(1)
     first = int(np.argmax(s >= 0.5)) if (s >= 0.5).any() else None
     with score_box.container():
-        c = st.columns(5)
+        c = st.columns(3)
         c[0].metric("Current score", f"{s[-1]:.2f}")
         c[1].metric("Peak", f"{s.max():.2f}")
         c[2].metric("Average", f"{s.mean():.2f}")
-        c[3].metric("Frames ≥ 0.5", f"{100 * (s >= 0.5).mean():.0f}%")
-        c[4].metric("First alert", f"frame {first}" if first is not None else "None")
+        c = st.columns(2)
+        c[0].metric("Frames ≥ 0.5", f"{100 * (s >= 0.5).mean():.0f}%")
+        c[1].metric("First alert", f"frame {first}" if first is not None else "None")
     if len(history) > 1:
         chart_box.line_chart(history, height=220)
 
@@ -166,16 +167,10 @@ img_col, info_col = st.columns([3, 2], gap="large")
 # Bottom message placeholder (only filled when a seizure is detected)
 footer_box = st.empty()
 
+# Status, score metrics and chart sit beside the video, so they stay visible while it plays
 with info_col:
-    # Second logo: sits beside the video, so it stays visible while a video/camera plays
-    if HAS_LOGO:
-        st.image(LOGO_PATH, use_container_width=True)
     status_box = st.empty()
     show_result(status_box, False)
-
-# Score metrics and chart: centered below the video
-_, score_col, _ = st.columns([1, 6, 1])
-with score_col:
     score_box = st.empty()
     chart_box = st.empty()
 
