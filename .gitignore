@@ -4,6 +4,5 @@ __pycache__/
 .DS_Store
 *.zip
 *.mp4
-# Unused weights (only yolov8s-pose.pt, VSViG-base.pth, dy_point_order.pt are needed)
+# Unused weights
 yolov8n-pose.pt
-VSViG/pose.pth
