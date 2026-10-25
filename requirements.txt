@@ -1,0 +1,9 @@
+streamlit
+streamlit-webrtc
+opencv-python-headless
+numpy
+av
+torch
+torchvision
+ultralytics
+timm
