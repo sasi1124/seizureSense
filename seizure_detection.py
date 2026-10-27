@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -6,14 +7,18 @@ from collections import deque
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
 
 # ---------- paths ----------
-VSVIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VSViG")
+HERE = os.path.dirname(os.path.abspath(__file__))
+VSVIG_DIR = os.path.join(HERE, "VSViG")
 sys.path.insert(0, VSVIG_DIR)
+sys.path.insert(0, os.path.join(HERE, "lwopenpose"))
+from models.with_mobilenet import PoseEstimationWithMobileNet  # noqa: E402
+from modules.keypoints import extract_keypoints, group_keypoints  # noqa: E402
 
 # ---------- settings ----------
-POSE_MODEL = "yolov8s-pose.pt"
+POSE_WEIGHTS = os.path.join(VSVIG_DIR, "pose.pth")
+POSE_HEIGHT = 256       # frames are shrunk to this height for the pose model
 KPT_CONF = 0.5
 VSVIG_THRESHOLD = 0.5   # VSViG seizure probability needed
 VSVIG_EVERY = 10        # run VSViG every N frames (it looks at the last 30)
@@ -23,11 +28,74 @@ MOTION_WINDOW = 1.0     # seconds of movement the score looks at
 MOTION_FULL = 4.0       # body speed (torso-lengths/sec) that counts as a score of 1.0
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-pose = YOLO(POSE_MODEL)
 
-# YOLO (COCO-17) -> VSViG's 15 points:
-# nose, R sho, R elb, R wri, L sho, L elb, L wri, R hip, R knee, R ank, L hip, L knee, L ank, R ear, L ear
-TO_VSVIG = [0, 6, 8, 10, 5, 7, 9, 12, 14, 16, 11, 13, 15, 4, 3]
+
+# ---------- pose model ----------
+# VSViG's own pose model: Lightweight OpenPose fine-tuned on patients in bed.
+# Much more accurate than COCO-trained YOLO on people lying down or under blankets.
+# Its 18 points: nose, neck, R sho, R elb, R wri, L sho, L elb, L wri,
+# R hip, R knee, R ank, L hip, L knee, L ank, R eye, L eye, R ear, L ear
+BONES = [(1, 2), (1, 5), (2, 3), (3, 4), (5, 6), (6, 7), (1, 8), (8, 9), (9, 10),
+         (1, 11), (11, 12), (12, 13), (1, 0), (0, 14), (14, 16), (0, 15), (15, 17)]
+
+# OpenPose -> VSViG's 15 points:
+# nose, L eye, R eye, R sho, R elb, R wri, L sho, L elb, L wri, R hip, R knee, R ank, L hip, L knee, L ank
+TO_VSVIG = [0, 15, 14, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+# OpenPose -> COCO-17 order, used by the rule checks below
+TO_COCO = [0, 15, 14, 17, 16, 5, 2, 6, 3, 7, 4, 11, 8, 12, 9, 13, 10]
+
+pose_net = PoseEstimationWithMobileNet()
+pose_net.load_state_dict(torch.load(POSE_WEIGHTS, map_location="cpu")["state_dict"])
+pose_net = pose_net.eval().to(DEVICE)
+
+
+@torch.no_grad()
+def detect_pose(frame):
+    """frame: BGR image. Returns the most confident person's (18, 3) keypoints
+    (x, y, conf) in frame pixels, conf = 0 for joints not found. None if nobody is found."""
+    stride, upsample = 8, 4
+    scale = POSE_HEIGHT / frame.shape[0]
+    img = cv2.resize(frame, (0, 0), fx=scale, fy=scale).astype(np.float32)
+    img = (img - 128) / 256
+    pad_w = math.ceil(img.shape[1] / stride) * stride - img.shape[1]
+    img = np.pad(img, ((0, 0), (0, pad_w), (0, 0)))
+
+    x = torch.from_numpy(img).permute(2, 0, 1)[None].to(DEVICE)
+    heatmaps, pafs = pose_net(x)[-2:]
+    heatmaps = cv2.resize(heatmaps[0].permute(1, 2, 0).cpu().numpy(), (0, 0), fx=upsample, fy=upsample,
+                          interpolation=cv2.INTER_CUBIC)
+    pafs = cv2.resize(pafs[0].permute(1, 2, 0).cpu().numpy(), (0, 0), fx=upsample, fy=upsample,
+                      interpolation=cv2.INTER_CUBIC)
+
+    by_type, total = [], 0
+    for i in range(18):
+        total += extract_keypoints(heatmaps[:, :, i], by_type, total)
+    people, all_kp = group_keypoints(by_type, pafs)
+    if len(people) == 0:
+        return None
+    all_kp[:, :2] = all_kp[:, :2] * stride / upsample / scale
+
+    best = max(people, key=lambda p: p[18])     # the patient: the most complete, confident skeleton
+    kp = np.zeros((18, 3))
+    for i in range(18):
+        if best[i] != -1:
+            kp[i] = all_kp[int(best[i]), :3]
+    return kp
+
+
+def draw_skeleton(frame, kp, color=(0, 200, 0)):
+    """Draw the 18-keypoint skeleton onto frame (in place)."""
+    if kp is None:
+        return frame
+    pts = kp[:, :2].astype(int)
+    seen = kp[:, 2] > 0
+    for a, b in BONES:
+        if seen[a] and seen[b]:
+            cv2.line(frame, tuple(pts[a]), tuple(pts[b]), color, 3)
+    for (x, y), ok in zip(pts, seen):
+        if ok:
+            cv2.circle(frame, (x, y), 4, (255, 255, 255), -1)
+    return frame
 
 
 # ---------- VSViG model ----------
@@ -158,6 +226,7 @@ class SeizureDetector:
         self.score = 0.0           # combined score shown in the app
         self.prev_body = None
         self.prev_t = None
+        self.last_kp = None        # last known position of each joint, for frames where it's hidden
         self.speeds = deque()      # (time, speed) over the last MOTION_WINDOW seconds
         self.n = 0
         self.start = time.time()
@@ -181,6 +250,17 @@ class SeizureDetector:
             self.motion_score *= 0.9   # no person / no motion: fade out
         self.score = max(self.prob, self.motion_score)
 
+    def _fill_missing(self, kp):
+        """Joints the pose model can't see keep their last known position (confidence stays 0)."""
+        kp = kp.copy()
+        missing = kp[:, 2] <= 0
+        if self.last_kp is not None:
+            kp[missing, :2] = self.last_kp[missing, :2]
+        elif (~missing).any():
+            kp[missing, :2] = kp[~missing, :2].mean(axis=0)
+        self.last_kp = kp
+        return kp
+
     def process(self, frame, t=None):
         """frame: BGR image. t: time in seconds (video time); defaults to wall-clock."""
         if t is None:
@@ -188,30 +268,26 @@ class SeizureDetector:
         self.n += 1
         fps = max(self.n / max(t, 1e-6), 1)
 
-        res = pose(frame, device=DEVICE, conf=0.4, verbose=False)[0]
-        drawn = res.plot(boxes=False)
+        kp = detect_pose(frame)
+        drawn = draw_skeleton(frame.copy(), kp)
         found = set()
 
-        if res.keypoints is not None and len(res.keypoints.data):
-            # watch the biggest person (the patient)
-            areas = (res.boxes.xywh[:, 2] * res.boxes.xywh[:, 3]).cpu().numpy()
-            k = res.keypoints.data.cpu().numpy()[int(np.argmax(areas))]
-
+        if kp is not None:
             # VSViG input
             h, w = frame.shape[:2]
             big = cv2.resize(frame, (1920, 1080))
-            k15 = k[TO_VSVIG].copy()
+            k15 = self._fill_missing(kp)[TO_VSVIG]
             k15[:, 0] *= 1920 / w
             k15[:, 1] *= 1080 / h
             self.patch_buf.append(extract_patches(big, k15[:, :2]))
-            self.kpt_buf.append(np.c_[k15[:, 0], k15[:, 1], k15[:, 2]])   # pixel coords on 1920x1080
+            self.kpt_buf.append(k15)   # (x, y, conf), pixel coords on 1920x1080
             if len(self.patch_buf) == CLIP and self.n % VSVIG_EVERY == 0:
                 self.prob = vsvig_probability(self.patch_buf, self.kpt_buf)
             if self.prob >= VSVIG_THRESHOLD:
                 found.add("VSViG model")
 
             # rule checks
-            body, hip, size = body_frame(k)
+            body, hip, size = body_frame(kp[TO_COCO])
             self._update_motion(body, t)
             if body is not None:
                 self.hist.append((t, body, hip, size))

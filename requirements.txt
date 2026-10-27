@@ -5,5 +5,4 @@ numpy
 av
 torch
 torchvision
-ultralytics
 timm
